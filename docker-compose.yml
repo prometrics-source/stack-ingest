@@ -1,0 +1,44 @@
+# /opt/infra/stacks/ingest/docker-compose.yml
+services:
+  raw-writer:
+    build: ./services/raw-writer
+    container_name: ingest-raw-writer
+    environment:
+      # --- Postgres ---
+      PG_DSN: "postgresql://admin:secret@172.21.0.5:5432/mydb"
+
+      # --- Logging/diagnostics ---
+      LOG_LEVEL: "DEBUG"           # INFO | DEBUG
+      PYTHONUNBUFFERED: "1"        # unbuffered stdout/stderr in Docker
+      DEBUG_SAMPLE_N: "1"          # log every payload body (0 disables)
+
+      # --- Metrics & heartbeat (also emitted to MQTT if enabled) ---
+      METRICS_INTERVAL_SEC: "10"   # emit metrics every 10s
+      HEARTBEAT_INTERVAL_SEC: "10"
+      METRICS_MQTT: "1"            # publish metrics/heartbeat to MQTT
+
+      # --- Feature flags (switch to "1" to disable the feature) ---
+      DISABLE_VALUES: "0"          # 1 = skip INSERTs into data_values
+      DISABLE_REPUBLISH: "0"       # 1 = skip MQTT republish
+
+      # --- Optional: very noisy wire-level MQTT tracing ---
+      # PAHO_TRACE: "1"
+
+      # --- Optional: if running multiple instances, customize client id prefix ---
+      # CLIENT_ID_PREFIX: "raw-writer"
+
+    restart: unless-stopped
+
+    # Simple healthcheck (process up)
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+    networks:
+      - infra
+
+networks:
+  infra:
+    external: true
