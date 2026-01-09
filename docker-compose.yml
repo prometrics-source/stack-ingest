@@ -2,7 +2,6 @@
 services:
   raw-writer:
     build: ./services/raw-writer
-    container_name: ingest-raw-writer
     environment:
       # --- Postgres (provided by Vault Agent / mounted secret file) ---
       PG_DSN_FILE: "/secrets/pg_dsn"
@@ -27,7 +26,7 @@ services:
       # --- Optional: if running multiple instances, customize client id prefix ---
       # CLIENT_ID_PREFIX: "raw-writer"
 
-    restart: unless-stopped
+    restart: always
 
     volumes:
       # Vault Agent (or other secret injector) should render DSN to this path
@@ -43,10 +42,13 @@ services:
     networks:
       - infra
 
+  # Sidecar: Vault Agent for raw-writer
   vault-agent-raw-writer:
     image: hashicorp/vault:1.21.1
-    container_name: ingest-vault-agent-raw-writer
-    restart: unless-stopped
+    restart: always
+    labels:
+      com.prometrics.sidecar: "true"
+      com.prometrics.sidecar_for: "raw-writer"
     command: >
       sh -lc "vault agent -config=/vault/config/vault-agent.hcl"
     volumes:
