@@ -4,8 +4,8 @@ services:
     build: ./services/raw-writer
     container_name: ingest-raw-writer
     environment:
-      # --- Postgres ---
-      PG_DSN: "postgresql://admin:secret@172.21.0.5:5432/mydb"
+      # --- Postgres (provided by Vault Agent / mounted secret file) ---
+      PG_DSN_FILE: "/secrets/pg_dsn"
 
       # --- Logging/diagnostics ---
       LOG_LEVEL: "DEBUG"           # INFO | DEBUG
@@ -29,6 +29,10 @@ services:
 
     restart: unless-stopped
 
+    volumes:
+      # Vault Agent (or other secret injector) should render DSN to this path
+      - ./secrets:/secrets:ro
+
     # Simple healthcheck (process up)
     healthcheck:
       test: ["CMD", "python3", "-c", "import sys; sys.exit(0)"]
@@ -36,6 +40,24 @@ services:
       timeout: 5s
       retries: 3
 
+    networks:
+      - infra
+
+  vault-agent-raw-writer:
+    image: hashicorp/vault:1.21.1
+    container_name: ingest-vault-agent-raw-writer
+    restart: unless-stopped
+    command: >
+      sh -lc "vault agent -config=/vault/config/vault-agent.hcl"
+    volumes:
+      - ./secrets:/secrets:rw
+      - ./vault-agent/vault-agent.hcl:/vault/config/vault-agent.hcl:ro
+      - ./vault-agent/pg_dsn.tpl:/vault/templates/pg_dsn.tpl:ro
+      - ./vault-agent/approle:/vault/approle:rw
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /usr/bin/docker:/usr/bin/docker:ro
+      - /lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu:ro
+      - /lib64:/lib64:ro
     networks:
       - infra
 

@@ -13,7 +13,8 @@ Adds:
 - Optional PAHO wire-level trace
 
 Env:
-  PG_DSN                 default postgresql://admin:admin@db:5432/prometrics
+  PG_DSN                 optional (prefer Vault-rendered file)
+  PG_DSN_FILE            default /secrets/pg_dsn (Vault Agent rendered DSN)
   LOG_LEVEL              INFO|DEBUG (default INFO)
   METRICS_INTERVAL_SEC   default 30
   HEARTBEAT_INTERVAL_SEC default 20
@@ -30,6 +31,7 @@ Env:
 import json
 import logging
 import os
+from pathlib import Path
 import threading
 import time
 from dataclasses import dataclass, field
@@ -44,7 +46,6 @@ from psycopg2.extras import DictCursor
 # Config / logging
 # ---------------------------------------------------------------------------
 
-PG_DSN = os.getenv("PG_DSN", "postgresql://admin:admin@db:5432/prometrics")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 METRICS_INTERVAL = int(os.getenv("METRICS_INTERVAL_SEC", "30"))
 HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL_SEC", "20"))
@@ -64,6 +65,49 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(threadName)s: %(message)s",
 )
 logger = logging.getLogger("raw-writer")
+
+# ---------------------------------------------------------------------------
+# DSN helpers (Vault-rendered preferred)
+# ---------------------------------------------------------------------------
+
+PG_DSN_FILE = os.getenv("PG_DSN_FILE", "/secrets/pg_dsn")
+
+
+def load_pg_dsn() -> Tuple[str, str]:
+    """
+    Load DSN from env (PG_DSN) or a rendered file (PG_DSN_FILE).
+    Returns (dsn, source_label).
+    """
+    env_dsn = os.getenv("PG_DSN")
+    if env_dsn and env_dsn.strip():
+        return env_dsn.strip(), "env:PG_DSN"
+
+    path = Path(PG_DSN_FILE)
+    if path.exists():
+        content = path.read_text(encoding="utf-8").strip()
+        if content:
+            return content, f"file:{path}"
+
+    raise RuntimeError(
+        f"PG_DSN not set and DSN file empty/missing at {path}. "
+        "Provide a Vault-rendered DSN via PG_DSN_FILE or set PG_DSN explicitly."
+    )
+
+
+def redact_dsn_for_log(dsn: str) -> str:
+    """
+    Return DSN without credentials for safe logging.
+    """
+    try:
+        from urllib.parse import urlparse
+
+        u = urlparse(dsn)
+        host = u.hostname or ""
+        port = f":{u.port}" if u.port else ""
+        db = u.path.lstrip("/") if u.path else ""
+        return f"{u.scheme}://{host}{port}/{db}"
+    except Exception:
+        return "***"
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -112,8 +156,9 @@ class DataPointMapping:
 def create_pg_conn() -> psycopg2.extensions.connection:
     while True:
         try:
-            logger.info("Connecting to Postgres...")
-            conn = psycopg2.connect(PG_DSN)
+            dsn, source = load_pg_dsn()
+            logger.info("Connecting to Postgres via %s (%s)", source, redact_dsn_for_log(dsn))
+            conn = psycopg2.connect(dsn)
             conn.autocommit = True
             logger.info("Connected to Postgres")
             return conn
@@ -673,6 +718,10 @@ class MQTTWorker(threading.Thread):
         except Exception as e:
             self.metrics["drop.db_fail"] += 1
             logger.error("DB insert mqtt_messages failed: %s", e, exc_info=True)
+            # If we can't persist the raw message, bail out to avoid writing
+            # downstream values without a corresponding mqtt_messages record.
+            self._maybe_flush_metrics()
+            return
 
         if not data or not self.dp_map:
             self._maybe_flush_metrics()
@@ -806,7 +855,12 @@ class MQTTWorker(threading.Thread):
 
 def main() -> None:
     logger.info("raw-writer starting up")
-    logger.info("Using PG_DSN=%s", PG_DSN)
+    try:
+        dsn, source = load_pg_dsn()
+        logger.info("Using PG_DSN from %s (%s)", source, redact_dsn_for_log(dsn))
+    except Exception as e:
+        logger.error("PG_DSN unavailable: %s", e)
+        raise
     logger.info(
         "Flags: DISABLE_VALUES=%s DISABLE_REPUBLISH=%s METRICS_MQTT=%s DEBUG_SAMPLE_N=%s",
         DISABLE_VALUES,
