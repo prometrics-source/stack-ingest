@@ -26,6 +26,7 @@ Env:
   SKIP_SCHEMA_CHECK      "1" to skip startup schema validation
   PAHO_TRACE             "1" to enable paho.mqtt wire-level on_log
   BROKER_RELOAD_INTERVAL_SEC  default 60 (reload v_mqtt_publishers_config)
+  PG_DSN_RELOAD_INTERVAL_SEC  default 10 (check for rotated DSN file)
 """
 
 import json
@@ -41,6 +42,8 @@ from typing import Any, Dict, List, Set, Tuple
 import paho.mqtt.client as mqtt
 import psycopg2
 from psycopg2.extras import DictCursor
+
+from software_module_health import HealthReporter, checks
 
 # ---------------------------------------------------------------------------
 # Config / logging
@@ -59,6 +62,7 @@ PAHO_TRACE = os.getenv("PAHO_TRACE", "0") == "1"
 
 # New: how often to reload broker configs / topics
 BROKER_RELOAD_INTERVAL = int(os.getenv("BROKER_RELOAD_INTERVAL_SEC", "60"))
+PG_DSN_RELOAD_INTERVAL = int(os.getenv("PG_DSN_RELOAD_INTERVAL_SEC", "10"))
 
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -87,6 +91,28 @@ def load_pg_dsn() -> Tuple[str, str]:
         content = path.read_text(encoding="utf-8").strip()
         if content:
             return content, f"file:{path}"
+
+    raise RuntimeError(
+        f"PG_DSN not set and DSN file empty/missing at {path}. "
+        "Provide a Vault-rendered DSN via PG_DSN_FILE or set PG_DSN explicitly."
+    )
+
+
+def load_pg_dsn_with_meta() -> Tuple[str, str, float | None]:
+    """
+    Load DSN plus file mtime (if sourced from file).
+    Returns (dsn, source_label, mtime).
+    """
+    env_dsn = os.getenv("PG_DSN")
+    if env_dsn and env_dsn.strip():
+        return env_dsn.strip(), "env:PG_DSN", None
+
+    path = Path(PG_DSN_FILE)
+    if path.exists():
+        stat = path.stat()
+        content = path.read_text(encoding="utf-8").strip()
+        if content:
+            return content, f"file:{path}", stat.st_mtime
 
     raise RuntimeError(
         f"PG_DSN not set and DSN file empty/missing at {path}. "
@@ -156,7 +182,7 @@ class DataPointMapping:
 def create_pg_conn() -> psycopg2.extensions.connection:
     while True:
         try:
-            dsn, source = load_pg_dsn()
+            dsn, source, _ = load_pg_dsn_with_meta()
             logger.info("Connecting to Postgres via %s (%s)", source, redact_dsn_for_log(dsn))
             conn = psycopg2.connect(dsn)
             conn.autocommit = True
@@ -438,6 +464,10 @@ class MQTTWorker(threading.Thread):
         self.dp_map: Dict[Tuple[str, str], DataPointMapping] = {}
         self.topic_to_device: Dict[str, str] = dict(cfg.topic_to_device)
         self.dp_last_reload: float = 0.0
+        self._dsn_value: str = ""
+        self._dsn_source: str = ""
+        self._dsn_mtime: float | None = None
+        self._dsn_last_check: float = 0.0
 
         # Diagnostics counters
         self.metrics = {
@@ -472,14 +502,18 @@ class MQTTWorker(threading.Thread):
         if cfg.broker_username:
             self.client.username_pw_set(cfg.broker_username, cfg.broker_password or "")
 
-        # LWT + heartbeat topic roots
-        self.topic_root = f"ingestor/{(cfg.broker_name or cfg.broker_host).replace(' ', '_')}"
-        self.client.will_set(
-            f"{self.topic_root}/status",
-            json.dumps({"state": "offline"}),
-            qos=0,
-            retain=True,
+        # Health reporter (replaces hand-rolled LWT, heartbeat, metrics publishing)
+        instance_id = (cfg.broker_name or cfg.broker_host).replace(" ", "_")
+        self.reporter = HealthReporter(
+            "ingestor",
+            instance_id=instance_id,
+            mqtt_client=self.client,
+            heartbeat_interval=HEARTBEAT_INTERVAL,
+            metrics_interval=METRICS_INTERVAL,
         )
+        self.reporter.register_check("mqtt", checks.make_mqtt_connected_check(self.client))
+        self.reporter.register_check("creds", checks.make_credential_freshness_check(PG_DSN_FILE))
+        self.reporter.configure_lwt(self.client)
 
         # Bind callbacks
         self.client.on_connect = self.on_connect
@@ -527,7 +561,8 @@ class MQTTWorker(threading.Thread):
             self.client._client_id.decode(),
         )
 
-        self.pg_conn = create_pg_conn()
+        self._connect_pg()
+        self.reporter.register_check("db", checks.make_db_ping_check(lambda: self.pg_conn))
         if not SKIP_SCHEMA_CHECK:
             try:
                 check_schema(self.pg_conn)
@@ -537,7 +572,7 @@ class MQTTWorker(threading.Thread):
 
         self.dp_map = load_data_point_mappings(self.pg_conn)
         self.dp_last_reload = time.time()
-
+        self.reporter.start()
         while True:
             try:
                 logger.info(
@@ -557,6 +592,70 @@ class MQTTWorker(threading.Thread):
                 )
                 time.sleep(5)
 
+    # ----- Postgres rotation handling -------------------------------------
+
+    def _connect_pg(self) -> None:
+        while True:
+            try:
+                dsn, source, mtime = load_pg_dsn_with_meta()
+                self._dsn_value = dsn
+                self._dsn_source = source
+                self._dsn_mtime = mtime
+                self._dsn_last_check = time.time()
+                logger.info("Connecting to Postgres via %s (%s)", source, redact_dsn_for_log(dsn))
+                conn = psycopg2.connect(dsn)
+                conn.autocommit = True
+                self.pg_conn = conn
+                logger.info("Connected to Postgres")
+                return
+            except Exception as e:
+                logger.error("Failed to connect to Postgres: %s", e, exc_info=True)
+                time.sleep(5)
+
+    def _maybe_reload_pg_dsn(self, force: bool = False) -> None:
+        now = time.time()
+        if not force and (now - self._dsn_last_check) < PG_DSN_RELOAD_INTERVAL:
+            return
+        self._dsn_last_check = now
+
+        try:
+            dsn, source, mtime = load_pg_dsn_with_meta()
+        except Exception as e:
+            logger.error("Failed to read PG_DSN: %s", e, exc_info=True)
+            return
+
+        changed = False
+        if source.startswith("file:"):
+            if self._dsn_mtime is None or mtime is None:
+                changed = dsn != self._dsn_value
+            else:
+                changed = (mtime != self._dsn_mtime) or (dsn != self._dsn_value)
+        else:
+            changed = dsn != self._dsn_value
+
+        if not changed:
+            return
+
+        logger.warning("Detected updated PG_DSN (%s); will reconnect", source)
+        self._dsn_value = dsn
+        self._dsn_source = source
+        self._dsn_mtime = mtime
+        self._mark_pg_for_reconnect()
+
+    def _mark_pg_for_reconnect(self) -> None:
+        if self.pg_conn and not self.pg_conn.closed:
+            try:
+                self.pg_conn.close()
+            except Exception:
+                pass
+        self.pg_conn = None
+
+    def _should_reconnect_on_db_error(self, err: Exception) -> bool:
+        if isinstance(err, psycopg2.Error):
+            # 42501 insufficient_privilege, 28P01 invalid_password, 28000 auth spec
+            return err.pgcode in ("42501", "28P01", "28000")
+        return False
+
     # ----- MQTT callbacks ---------------------------------------------------
 
     def on_connect(self, client: mqtt.Client, userdata, flags, rc):
@@ -568,16 +667,6 @@ class MQTTWorker(threading.Thread):
             len(self.cfg.topics),
         )
         if rc == 0:
-            # Heartbeat online
-            try:
-                client.publish(
-                    f"{self.topic_root}/status",
-                    json.dumps({"state": "online", "ts": datetime.now(timezone.utc).isoformat()}),
-                    qos=0,
-                    retain=True,
-                )
-            except Exception:
-                pass
             for t in sorted(self.cfg.topics):
                 res, mid = client.subscribe(t, qos=0)
                 logger.info("Subscribe %s -> result=%s mid=%s", t, res, mid)
@@ -599,29 +688,10 @@ class MQTTWorker(threading.Thread):
             summary = dict(self.metrics)
             summary["dp_map_size"] = len(self.dp_map)
             logger.info("METRICS %s", json.dumps(summary, separators=(",", ":")))
-            if METRICS_MQTT:
-                try:
-                    self.client.publish(
-                        f"{self.topic_root}/metrics",
-                        json.dumps({**summary, "ts": datetime.now(timezone.utc).isoformat()}),
-                        qos=0,
-                        retain=False,
-                    )
-                except Exception as e:
-                    logger.warning("Failed to publish metrics: %s", e)
-
-        # heartbeat
-        if now - self._last_heartbeat >= HEARTBEAT_INTERVAL:
-            self._last_heartbeat = now
-            try:
-                self.client.publish(
-                    f"{self.topic_root}/heartbeat",
-                    json.dumps({"ts": datetime.now(timezone.utc).isoformat()}),
-                    qos=0,
-                    retain=False,
-                )
-            except Exception:
-                pass
+            # Sync counters to health reporter
+            for k, v in self.metrics.items():
+                self.reporter.set_gauge(k, v)
+            self.reporter.set_gauge("dp_map_size", len(self.dp_map))
 
     def on_message(self, client: mqtt.Client, userdata, msg: mqtt.MQTTMessage):
         self.metrics["msgs_rx"] += 1
@@ -629,6 +699,9 @@ class MQTTWorker(threading.Thread):
 
         topic = msg.topic
         qos = msg.qos
+
+        # Check for rotated DB credentials (Vault Agent writes PG_DSN_FILE)
+        self._maybe_reload_pg_dsn()
 
         try:
             payload_text = msg.payload.decode("utf-8", errors="ignore")
@@ -641,7 +714,7 @@ class MQTTWorker(threading.Thread):
         # Ensure PG connection
         if self.pg_conn is None or self.pg_conn.closed:
             logger.warning("Postgres connection lost in worker, reconnecting...")
-            self.pg_conn = create_pg_conn()
+            self._connect_pg()
             if not SKIP_SCHEMA_CHECK:
                 try:
                     check_schema(self.pg_conn)
@@ -658,6 +731,9 @@ class MQTTWorker(threading.Thread):
                 self.dp_last_reload = now_ts
             except Exception as e:
                 logger.error("Error reloading data point mappings: %s", e, exc_info=True)
+                if self._should_reconnect_on_db_error(e):
+                    self._maybe_reload_pg_dsn(force=True)
+                    self._mark_pg_for_reconnect()
 
         now = datetime.now(timezone.utc)
 
@@ -684,6 +760,9 @@ class MQTTWorker(threading.Thread):
             except Exception as e:
                 self.metrics["drop.db_fail"] += 1
                 logger.error("DB insert (unknown device) failed: %s", e, exc_info=True)
+                if self._should_reconnect_on_db_error(e):
+                    self._maybe_reload_pg_dsn(force=True)
+                    self._mark_pg_for_reconnect()
             self._maybe_flush_metrics()
             return
 
@@ -718,6 +797,9 @@ class MQTTWorker(threading.Thread):
         except Exception as e:
             self.metrics["drop.db_fail"] += 1
             logger.error("DB insert mqtt_messages failed: %s", e, exc_info=True)
+            if self._should_reconnect_on_db_error(e):
+                self._maybe_reload_pg_dsn(force=True)
+                self._mark_pg_for_reconnect()
             # If we can't persist the raw message, bail out to avoid writing
             # downstream values without a corresponding mqtt_messages record.
             self._maybe_flush_metrics()
@@ -783,6 +865,9 @@ class MQTTWorker(threading.Thread):
             except Exception as e:
                 self.metrics["drop.db_fail"] += 1
                 logger.error("Insert into data_values failed: %s", e, exc_info=True)
+                if self._should_reconnect_on_db_error(e):
+                    self._maybe_reload_pg_dsn(force=True)
+                    self._mark_pg_for_reconnect()
 
         # Fetch paths
         asset_paths: Dict[str, str] = {}
@@ -838,15 +923,6 @@ class MQTTWorker(threading.Thread):
                 self.cfg.broker_port,
                 rc,
             )
-        try:
-            client.publish(
-                f"{self.topic_root}/status",
-                json.dumps({"state": "offline"}),
-                qos=0,
-                retain=True,
-            )
-        except Exception:
-            pass
 
 
 # ---------------------------------------------------------------------------

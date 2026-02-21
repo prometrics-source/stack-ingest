@@ -15,7 +15,13 @@ vault-agent/approle/
 **/node_modules/
 **/dist/
 
+# --- Shared lib (installed via pip or copied from software-module-health repo) ---
+software_module_health/
+
 # OS / IDE
 .DS_Store
 .vscode/
 .idea/
+__pycache__/
+*.pyc
+

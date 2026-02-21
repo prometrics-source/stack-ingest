@@ -1,6 +1,6 @@
 # /opt/infra/stacks/ingest/docker-compose.yml
 services:
-  raw-writer:
+  ingestor:
     build: ./services/raw-writer
     environment:
       # --- Postgres (provided by Vault Agent / mounted secret file) ---
@@ -26,11 +26,15 @@ services:
       # --- Optional: if running multiple instances, customize client id prefix ---
       # CLIENT_ID_PREFIX: "raw-writer"
 
+      # Health reporting shared library
+      PYTHONPATH: "/opt"
+
     restart: always
 
     volumes:
       # Vault Agent (or other secret injector) should render DSN to this path
       - ./secrets:/secrets:ro
+      - ./software_module_health:/opt/software_module_health:ro
 
     # Simple healthcheck (process up)
     healthcheck:
@@ -48,7 +52,7 @@ services:
     restart: always
     labels:
       com.prometrics.sidecar: "true"
-      com.prometrics.sidecar_for: "raw-writer"
+      com.prometrics.sidecar_for: "ingestor"
     command: >
       sh -lc "vault agent -config=/vault/config/vault-agent.hcl"
     volumes:
@@ -56,6 +60,7 @@ services:
       - ./vault-agent/vault-agent.hcl:/vault/config/vault-agent.hcl:ro
       - ./vault-agent/pg_dsn.tpl:/vault/templates/pg_dsn.tpl:ro
       - ./vault-agent/approle:/vault/approle:rw
+      - ./:/stack:ro
       - /var/run/docker.sock:/var/run/docker.sock
       - /usr/bin/docker:/usr/bin/docker:ro
       - /lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu:ro
