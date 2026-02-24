@@ -1012,7 +1012,10 @@ def main() -> None:
                             cfg.broker_host,
                             cfg.broker_port,
                         )
-                    w.add_or_update_topic(topic, dev)
+                        w.add_or_update_topic(topic, dev)
+                    elif dev and w.topic_to_device.get(topic) != dev:
+                        # Device mapping changed; update without re-subscribing
+                        w.topic_to_device[topic] = dev
 
             # (Optional) We could log brokers that disappeared, but we do not
             # shut workers down automatically in this version.
