@@ -61,6 +61,7 @@ services:
       - ./vault-agent/pg_dsn.tpl:/vault/templates/pg_dsn.tpl:ro
       - ./vault-agent/approle:/vault/approle:rw
       - ./:/stack:ro
+      - /opt/infra/stacks/vault/tls/ca.crt:/vault/tls/ca.crt:ro
       - /var/run/docker.sock:/var/run/docker.sock
       - /usr/bin/docker:/usr/bin/docker:ro
       - /lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu:ro

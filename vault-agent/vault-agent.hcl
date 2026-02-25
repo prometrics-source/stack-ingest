@@ -2,7 +2,8 @@ exit_after_auth = false
 pid_file = "/tmp/vault-agent.pid"
 
 vault {
-  address = "http://vault:8200"
+  address = "https://vault:8200"
+  ca_cert = "/vault/tls/ca.crt"
 }
 
 auto_auth {
